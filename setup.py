@@ -971,6 +971,11 @@ if _is_hip():
 
 if _is_cuda():
     ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
+    # Opt-in GeminiFS ops: built only when VLLM_BUILD_GEMINIFS=1. Links against a
+    # prebuilt GeminiFS checkout (GEMINIFS_ROOT); optional=True so a disabled or
+    # missing build never fails the wheel.
+    if os.environ.get("VLLM_BUILD_GEMINIFS") == "1":
+        ext_modules.append(CMakeExtension(name="vllm.geminifs_ops", optional=True))
     if envs.VLLM_USE_PRECOMPILED or (
         CUDA_HOME and get_nvcc_cuda_version() >= Version("12.3")
     ):

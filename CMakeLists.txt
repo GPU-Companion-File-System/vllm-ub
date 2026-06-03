@@ -276,6 +276,75 @@ if(VLLM_GPU_LANG STREQUAL "CUDA" OR VLLM_GPU_LANG STREQUAL "HIP")
 endif()
 
 #
+# geminifs_ops extension (opt-in; links ONLY against prebuilt GeminiFS libs).
+#
+# Enabled when VLLM_BUILD_GEMINIFS=1 and targeting CUDA. The GeminiFS sources
+# are NEVER compiled here; we only validate and link the prebuilt shared
+# libraries from an external GeminiFS checkout pointed to by GEMINIFS_ROOT
+# (fallback LMCACHE_GEMINIFS_ROOT).
+#
+if(VLLM_GPU_LANG STREQUAL "CUDA" AND "$ENV{VLLM_BUILD_GEMINIFS}" STREQUAL "1")
+  # Resolve the prebuilt GeminiFS checkout.
+  if(DEFINED ENV{GEMINIFS_ROOT})
+    set(GEMINIFS_ROOT "$ENV{GEMINIFS_ROOT}")
+  elseif(DEFINED ENV{LMCACHE_GEMINIFS_ROOT})
+    set(GEMINIFS_ROOT "$ENV{LMCACHE_GEMINIFS_ROOT}")
+  else()
+    message(FATAL_ERROR
+      "VLLM_BUILD_GEMINIFS=1 but neither GEMINIFS_ROOT nor "
+      "LMCACHE_GEMINIFS_ROOT is set. Point one at your prebuilt GeminiFS "
+      "checkout.")
+  endif()
+
+  set(GEMINIFS_INC_GEMINIFS "${GEMINIFS_ROOT}/libgeminifs/include")
+  set(GEMINIFS_INC_NVM      "${GEMINIFS_ROOT}/libnvm/include")
+  set(GEMINIFS_LIB_DIR      "${GEMINIFS_ROOT}/build/lib")
+  set(GEMINIFS_LIB_GEMINIFS "${GEMINIFS_LIB_DIR}/libgeminifs.so")
+  set(GEMINIFS_LIB_NVM      "${GEMINIFS_LIB_DIR}/libnvm.so")
+
+  # Validate prebuilt artifacts exist; never attempt to build GeminiFS here.
+  foreach(_geminifs_path
+      "${GEMINIFS_INC_GEMINIFS}/geminifs.cuh"
+      "${GEMINIFS_INC_GEMINIFS}/io_deamon.cuh"
+      "${GEMINIFS_INC_NVM}"
+      "${GEMINIFS_LIB_GEMINIFS}"
+      "${GEMINIFS_LIB_NVM}"
+      "${CMAKE_CURRENT_SOURCE_DIR}/csrc/geminifs/pybind.cu")
+    if(NOT EXISTS "${_geminifs_path}")
+      message(FATAL_ERROR
+        "geminifs_ops enabled but a required prebuilt artifact is missing: "
+        "${_geminifs_path}. Build GeminiFS separately and set GEMINIFS_ROOT "
+        "correctly; this build will NOT compile GeminiFS sources.")
+    endif()
+  endforeach()
+
+  set(GEMINIFS_EXT_SRC "csrc/geminifs/pybind.cu")
+
+  set_gencode_flags_for_srcs(
+    SRCS "${GEMINIFS_EXT_SRC}"
+    CUDA_ARCHS "${CUDA_ARCHS}")
+
+  message(STATUS "Enabling geminifs_ops extension (GeminiFS root: ${GEMINIFS_ROOT}).")
+
+  define_extension_target(
+    geminifs_ops
+    DESTINATION vllm
+    LANGUAGE ${VLLM_GPU_LANG}
+    SOURCES ${GEMINIFS_EXT_SRC}
+    COMPILE_FLAGS "-std=c++20"
+    INCLUDE_DIRECTORIES ${GEMINIFS_INC_GEMINIFS} ${GEMINIFS_INC_NVM}
+    LIBRARIES ${GEMINIFS_LIB_GEMINIFS} ${GEMINIFS_LIB_NVM}
+    WITH_SOABI)
+
+  # define_extension_target does not set RPATH. Make the installed
+  # vllm/geminifs_ops*.so find libgeminifs.so / libnvm.so at runtime.
+  set_target_properties(geminifs_ops PROPERTIES
+    BUILD_RPATH   "${GEMINIFS_LIB_DIR}"
+    INSTALL_RPATH "${GEMINIFS_LIB_DIR}"
+    BUILD_WITH_INSTALL_RPATH OFF)
+endif()
+
+#
 # _C extension
 #
 
