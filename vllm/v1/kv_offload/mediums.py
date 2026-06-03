@@ -37,3 +37,13 @@ class CPULoadStoreSpec(BlockIDsLoadStoreSpec):
     @staticmethod
     def medium() -> str:
         return "CPU"
+
+
+class GeminifsLoadStoreSpec(BlockIDsLoadStoreSpec):
+    """
+    Spec for loading/storing a KV block to GeminiFS SSD.
+    """
+
+    @staticmethod
+    def medium() -> str:
+        return "Geminifs"

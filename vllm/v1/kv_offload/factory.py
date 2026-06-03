@@ -56,3 +56,11 @@ class OffloadingSpecFactory:
 OffloadingSpecFactory.register_spec(
     "CPUOffloadingSpec", "vllm.v1.kv_offload.cpu", "CPUOffloadingSpec"
 )
+# Optional GeminiFS-backed offloading spec. The native extension is imported
+# lazily by the worker handler, so registering the spec does not require
+# GeminiFS to be built for CPU-only imports.
+OffloadingSpecFactory.register_spec(
+    "GeminifsOffloadingSpec",
+    "vllm.v1.kv_offload.geminifs",
+    "GeminifsOffloadingSpec",
+)
