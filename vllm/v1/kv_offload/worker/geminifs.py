@@ -79,6 +79,8 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
         client_ctrl_ptr: int,
         gpu_file_ids: list[int],
         is_read: bool,
+        stream_pool_size: int,
+        ensure_daemon_launched: Any,
     ):
         assert gpu_tensors
         self.gpu_tensors = gpu_tensors
@@ -115,12 +117,83 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
             else (GPULoadStoreSpec.medium(), GeminifsLoadStoreSpec.medium())
         )
 
+        # GeminiFS launches persistent device-side IO daemon kernels that spin
+        # forever. While they run, the CUDA driver blocks every context-resource
+        # operation (cudaStreamCreate, cudaEventCreate, cudaMalloc) until the GPU
+        # goes idle, which never happens. So all CUDA streams/events this handler
+        # will ever use are created HERE, before the daemon is launched, and the
+        # daemon launch itself is deferred (see ensure_daemon_launched) until the
+        # first transfer, i.e. after vLLM has finished warming up the allocator
+        # and cuBLAS. Once these resources exist, reusing them is safe.
+        self._ensure_daemon_launched = ensure_daemon_launched
         self._transfer_events: dict[int, torch.Event] = {}
         self._transfers: deque[GeminifsTransfer] = deque()
-        self._stream_pool: list[torch.cuda.Stream] = []
-        self._event_pool: list[torch.Event] = []
+        # Pre-created, never grown after the daemon launches.
+        self._stream_pool: list[torch.cuda.Stream] = [
+            torch.cuda.Stream() for _ in range(stream_pool_size)
+        ]
+        # Two events per stream (start + end).
+        self._event_pool: list[torch.Event] = [
+            torch.Event(enable_timing=True) for _ in range(2 * stream_pool_size)
+        ]
+        # Results of transfers that were force-drained (below) to free pooled
+        # streams/events; returned on the next get_finished() call.
+        self._drained_results: list[TransferResult] = []
+
+    def _recycle_oldest_blocking(self) -> None:
+        """Block on the oldest in-flight transfer and return its resources.
+
+        Used only when the pools are exhausted (more concurrent transfers than
+        the pool size). We cannot allocate new streams/events while the daemon
+        runs, and the connector requires transfer_async to succeed, so instead
+        we wait for the oldest transfer to complete and recycle it. The wait is
+        on a specific event (not a device-wide sync), so it does not block on the
+        persistent daemon kernels.
+        """
+        transfer = self._transfers.popleft()
+        transfer.end_event.synchronize()
+        transfer_time = transfer.start_event.elapsed_time(transfer.end_event) * 1e-3
+        self._drained_results.append(
+            TransferResult(
+                job_id=transfer.job_id,
+                success=True,
+                transfer_size=transfer.num_bytes,
+                transfer_time=transfer_time,
+                transfer_type=self.transfer_type,
+            )
+        )
+        self._stream_pool.append(transfer.stream)
+        self._event_pool.append(transfer.end_event)
+        self._event_pool.append(transfer.start_event)
+        del self._transfer_events[transfer.job_id]
+
+    def _acquire_stream(self) -> torch.cuda.Stream:
+        while not self._stream_pool:
+            if not self._transfers:
+                # Unreachable when the pool is sized correctly; fall back rather
+                # than spin forever.
+                logger.warning(
+                    "GeminiFS stream pool exhausted with no in-flight transfers"
+                )
+                return torch.cuda.Stream()
+            self._recycle_oldest_blocking()
+        return self._stream_pool.pop()
+
+    def _acquire_event(self) -> torch.Event:
+        while not self._event_pool:
+            if not self._transfers:
+                logger.warning(
+                    "GeminiFS event pool exhausted with no in-flight transfers"
+                )
+                return torch.Event(enable_timing=True)
+            self._recycle_oldest_blocking()
+        return self._event_pool.pop()
 
     def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
+        # Launch the persistent IO daemon kernels lazily, on the first transfer,
+        # so that all CUDA resource allocation (vLLM warmup + the pools above)
+        # has already completed.
+        self._ensure_daemon_launched()
         src_spec, dst_spec = transfer_spec
         if self.is_read:
             assert isinstance(src_spec, GeminifsLoadStoreSpec)
@@ -148,17 +221,11 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
 
         # Use the same stream/event model as the CPU offload handler so the
         # connector can poll completions without blocking the engine step.
-        stream = self._stream_pool.pop() if self._stream_pool else torch.cuda.Stream()
-        start_event = (
-            self._event_pool.pop()
-            if self._event_pool
-            else torch.Event(enable_timing=True)
-        )
-        end_event = (
-            self._event_pool.pop()
-            if self._event_pool
-            else torch.Event(enable_timing=True)
-        )
+        # Streams/events come from the pre-created pools (never allocated while
+        # the daemon runs); see _acquire_* / _recycle_oldest_blocking.
+        stream = self._acquire_stream()
+        start_event = self._acquire_event()
+        end_event = self._acquire_event()
 
         if not self.is_read:
             # Stores must wait until model kernels have finished producing the
@@ -221,7 +288,9 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
         return True
 
     def get_finished(self) -> list[TransferResult]:
-        results: list[TransferResult] = []
+        # Include any transfers that were force-drained to free pooled resources.
+        results: list[TransferResult] = self._drained_results
+        self._drained_results = []
         while self._transfers and self._transfers[0].end_event.query():
             transfer = self._transfers.popleft()
             transfer_time = (
@@ -365,12 +434,13 @@ class GpuGeminifsOffloadingHandlers:
             )
         gpu_file_shape = extra_config.get(
             "geminifs_gpu_file_shape",
-            [total_geminifs_block_size_in_bytes],
+            [1, 1, total_geminifs_block_size_in_bytes],
         )
         reset = bool(extra_config.get("geminifs_reset", True))
-        # register_granularity = int(
-        #     extra_config.get("geminifs_register_granularity", 0)
-        # )
+        # Number of CUDA streams (and 2x events) pre-created per direction before
+        # the daemon launches. This bounds how many transfers can be in flight
+        # concurrently without blocking; see SingleDirectionGeminifsOffloadingHandler.
+        stream_pool_size = int(extra_config.get("geminifs_stream_pool_size", 32))
 
         logger.info(
             "Initializing GeminiFS KV offload: files=%d, file_bytes=%d",
@@ -384,14 +454,35 @@ class GpuGeminifsOffloadingHandlers:
             list(gpu_file_shape),
             reset,
         )
-        if not self.geminifs.is_io_deamon_kernel_launched():
-            self.geminifs.launch_io_deamon_kernels()
+        # NOTE: the persistent IO daemon kernels are NOT launched here. Once they
+        # run, the CUDA driver blocks all context-resource allocation (streams,
+        # events, cudaMalloc) until the GPU is idle - which never happens - so
+        # launching them now would deadlock vLLM's subsequent warmup (cuBLAS init,
+        # CUDA-graph capture, allocator growth). Instead we defer the launch to
+        # the first KV transfer, by which point warmup has allocated everything.
+        # open_file / get_client_ctrl_ptr only touch state set up by the GeminiFS
+        # constructor, so they are safe to call before the launch.
         self.gpu_file_ids = [
             int(self.geminifs.open_file(device_id)) for _ in range(num_geminifs_blocks)
         ]
         self.client_ctrl_ptr = int(
             self.geminifs.get_client_ctrl_ptr(device_id, server_gpu_id)
         )
+
+        daemon_launch_lock = threading.Lock()
+
+        def ensure_daemon_launched() -> None:
+            # Process-wide, idempotent, thread-safe. is_io_deamon_kernel_launched()
+            # is the authoritative guard (the GeminiFS instance is a singleton).
+            if self.geminifs.is_io_deamon_kernel_launched():
+                return
+            with daemon_launch_lock:
+                if not self.geminifs.is_io_deamon_kernel_launched():
+                    logger.info(
+                        "Launching GeminiFS IO daemon kernels (deferred until "
+                        "after model warmup)"
+                    )
+                    self.geminifs.launch_io_deamon_kernels()
 
         self.gpu_to_geminifs_handler = SingleDirectionGeminifsOffloadingHandler(
             gpu_tensors=gpu_tensors,
@@ -401,6 +492,8 @@ class GpuGeminifsOffloadingHandlers:
             client_ctrl_ptr=self.client_ctrl_ptr,
             gpu_file_ids=self.gpu_file_ids,
             is_read=False,
+            stream_pool_size=stream_pool_size,
+            ensure_daemon_launched=ensure_daemon_launched,
         )
         self.geminifs_to_gpu_handler = SingleDirectionGeminifsOffloadingHandler(
             gpu_tensors=gpu_tensors,
@@ -410,4 +503,6 @@ class GpuGeminifsOffloadingHandlers:
             client_ctrl_ptr=self.client_ctrl_ptr,
             gpu_file_ids=self.gpu_file_ids,
             is_read=True,
+            stream_pool_size=stream_pool_size,
+            ensure_daemon_launched=ensure_daemon_launched,
         )
