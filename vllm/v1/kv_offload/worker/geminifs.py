@@ -68,6 +68,11 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
     Handles one transfer direction between GPU KV cache tensors and GeminiFS.
     Each offloaded KV block maps to one GeminiFS file. Inside that file, kernel
     sub-blocks are laid out as [sub-block][tensor 0 bytes][tensor 1 bytes]...
+
+    When more than one server storage backend is supplied (via client_ctrl_ptrs),
+    offloaded blocks are striped round-robin across the backends by their
+    offloaded block idx, so the aggregate KV cache is spread over several remote
+    GPUs instead of one.
     """
 
     def __init__(
@@ -76,7 +81,7 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
         gpu_block_size_factor: int,
         geminifs_block_size_factor: int,
         launch_remote_io_xfer: Any,
-        client_ctrl_ptr: int,
+        client_ctrl_ptrs: list[int],
         gpu_file_ids: list[int],
         is_read: bool,
         stream_pool_size: int,
@@ -108,7 +113,14 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
         self.total_gpu_block_size_in_bytes = offset
 
         self.launch_remote_io_xfer = launch_remote_io_xfer
-        self.client_ctrl_ptr = client_ctrl_ptr
+        # One client control pointer per server storage backend. With a single
+        # entry every block targets that one server (no striping). With multiple
+        # entries, offloaded blocks are striped round-robin across the servers by
+        # their offloaded block idx (see transfer_async). Each client pointer is
+        # bound to a distinct (client gpu, server gpu) pair, so the same idx
+        # always resolves to the same server for both stores and reads.
+        assert client_ctrl_ptrs
+        self.client_ctrl_ptrs = client_ctrl_ptrs
         self.gpu_file_ids = gpu_file_ids
         self.is_read = is_read
         self.transfer_type = (
@@ -246,6 +258,15 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
                     int(geminifs_block_id) % self.geminifs_block_size_factor
                 )
                 gpu_file_id = self.gpu_file_ids[offloaded_file_idx]
+                # Stripe offloaded blocks round-robin across server backends by
+                # offloaded block idx: with 2 backends, block 0 -> backend 0,
+                # block 1 -> backend 1, block 2 -> backend 0, ... Because the idx
+                # alone selects the backend, a store and its later read always
+                # land on the same server. With a single client pointer this
+                # always selects index 0 (no striping, original behavior).
+                client_ctrl_ptr = self.client_ctrl_ptrs[
+                    offloaded_file_idx % len(self.client_ctrl_ptrs)
+                ]
                 file_base_offset = (
                     file_block_idx * self.total_gpu_block_size_in_bytes
                 )
@@ -264,7 +285,7 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
                     # offsets. The pybind function launches the device-side IO
                     # request on the stream above.
                     self.launch_remote_io_xfer(
-                        self.client_ctrl_ptr,
+                        client_ctrl_ptr,
                         buffer_ptr,
                         int(block_bytes),
                         gpu_file_id,
@@ -423,7 +444,29 @@ class GpuGeminifsOffloadingHandlers:
             if device_id_config is not None
             else torch.cuda.current_device()
         )
-        server_gpu_id = int(extra_config.get("geminifs_server_gpu_id", device_id))
+        # Striping: when geminifs_stripe is enabled, offloaded blocks are spread
+        # round-robin (by offloaded block idx) across the server storage backends
+        # listed in geminifs_server_gpu_ids. Each server gets its own client
+        # control pointer (one per (client gpu, server gpu) pair). When disabled,
+        # a single server (geminifs_server_gpu_id, defaulting to this GPU) is
+        # used, which is the original single-backend behavior.
+        if bool(extra_config.get("geminifs_stripe", False)):
+            server_gpu_ids_config = extra_config.get("geminifs_server_gpu_ids")
+            if not server_gpu_ids_config:
+                raise ValueError(
+                    "geminifs_server_gpu_ids must be specified (a list of at "
+                    "least two server GPU ids) when geminifs_stripe is enabled"
+                )
+            server_gpu_ids = [int(gpu_id) for gpu_id in server_gpu_ids_config]
+            if len(server_gpu_ids) < 2:
+                raise ValueError(
+                    "geminifs_server_gpu_ids must contain at least two server "
+                    "GPU ids when geminifs_stripe is enabled"
+                )
+        else:
+            server_gpu_ids = [
+                int(extra_config.get("geminifs_server_gpu_id", device_id))
+            ]
         gpu_file_nums = int(
             extra_config.get("geminifs_gpu_file_nums", num_geminifs_blocks)
         )
@@ -465,9 +508,16 @@ class GpuGeminifsOffloadingHandlers:
         self.gpu_file_ids = [
             int(self.geminifs.open_file(device_id)) for _ in range(num_geminifs_blocks)
         ]
-        self.client_ctrl_ptr = int(
-            self.geminifs.get_client_ctrl_ptr(device_id, server_gpu_id)
-        )
+        self.client_ctrl_ptrs = [
+            int(self.geminifs.get_client_ctrl_ptr(device_id, server_gpu_id))
+            for server_gpu_id in server_gpu_ids
+        ]
+        if len(self.client_ctrl_ptrs) > 1:
+            logger.info(
+                "GeminiFS striping enabled across %d server backends: %s",
+                len(server_gpu_ids),
+                server_gpu_ids,
+            )
 
         daemon_launch_lock = threading.Lock()
 
@@ -484,12 +534,15 @@ class GpuGeminifsOffloadingHandlers:
                     )
                     self.geminifs.launch_io_deamon_kernels()
 
+        # Both directions share the same client_ctrl_ptrs list in the same order,
+        # so the round-robin striping maps each offloaded block idx to the same
+        # server backend on store and on read-back.
         self.gpu_to_geminifs_handler = SingleDirectionGeminifsOffloadingHandler(
             gpu_tensors=gpu_tensors,
             gpu_block_size_factor=gpu_block_size_factor,
             geminifs_block_size_factor=geminifs_block_size_factor,
             launch_remote_io_xfer=geminifs_ops.launch_remote_io_xfer,
-            client_ctrl_ptr=self.client_ctrl_ptr,
+            client_ctrl_ptrs=self.client_ctrl_ptrs,
             gpu_file_ids=self.gpu_file_ids,
             is_read=False,
             stream_pool_size=stream_pool_size,
@@ -500,7 +553,7 @@ class GpuGeminifsOffloadingHandlers:
             gpu_block_size_factor=gpu_block_size_factor,
             geminifs_block_size_factor=geminifs_block_size_factor,
             launch_remote_io_xfer=geminifs_ops.launch_remote_io_xfer,
-            client_ctrl_ptr=self.client_ctrl_ptr,
+            client_ctrl_ptrs=self.client_ctrl_ptrs,
             gpu_file_ids=self.gpu_file_ids,
             is_read=True,
             stream_pool_size=stream_pool_size,

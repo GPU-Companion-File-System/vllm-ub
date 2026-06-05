@@ -1,11 +1,13 @@
 // SPDX-License-Identifier: Apache-2.0
 
 #include <cuda_runtime.h>
+#include <nvtx3/nvToolsExt.h>
 #include <pybind11/pybind11.h>
 #include <pybind11/stl.h>
 #include <torch/extension.h>
 
 #include <cstdint>
+#include <cstdio>
 #include <memory>
 #include <sstream>
 #include <stdexcept>
@@ -33,6 +35,17 @@ void require_success(bool ok, const std::string& message) {
     throw std::runtime_error(message);
   }
 }
+
+// RAII NVTX range: pushes a named range on construction and pops it on
+// destruction, so the range is correctly closed even if the scope exits via
+// an exception.
+class NvtxRange {
+ public:
+  explicit NvtxRange(const char* name) { nvtxRangePushA(name); }
+  ~NvtxRange() { nvtxRangePop(); }
+  NvtxRange(const NvtxRange&) = delete;
+  NvtxRange& operator=(const NvtxRange&) = delete;
+};
 
 std::vector<size_t> to_shape(const std::vector<uint64_t>& input) {
   std::vector<size_t> shape;
@@ -124,6 +137,21 @@ void launch_remote_io_xfer(uintptr_t client_ctrl_ptr, uintptr_t buffer_ptr,
                            uint64_t size, uint32_t gpu_file_id,
                            uint64_t file_offset, bool is_read,
                            uintptr_t stream_ptr) {
+  NvtxRange nvtx_range("launch_remote_io_xfer");
+
+  std::fprintf(stderr,
+               "[geminifs] launch_remote_io_xfer: client_ctrl_ptr=0x%lx "
+               "buffer_ptr=0x%lx size=%lu gpu_file_id=%u file_offset=%lu "
+               "is_read=%d stream_ptr=0x%lx\n",
+               static_cast<unsigned long>(client_ctrl_ptr),
+               static_cast<unsigned long>(buffer_ptr),
+               static_cast<unsigned long>(size),
+               static_cast<unsigned int>(gpu_file_id),
+               static_cast<unsigned long>(file_offset),
+               static_cast<int>(is_read),
+               static_cast<unsigned long>(stream_ptr));
+  std::fflush(stderr);
+
   if (client_ctrl_ptr == 0) {
     throw std::runtime_error(
         "launch_remote_io_xfer requires non-zero client_ctrl_ptr");
@@ -141,6 +169,12 @@ void launch_remote_io_xfer(uintptr_t client_ctrl_ptr, uintptr_t buffer_ptr,
       client, buffer, static_cast<size_t>(size), gpu_file_id, file_offset,
       is_read);
   check_cuda_launch("deamon_remote_io_xfer_kernel");
+
+  // std::fprintf(stderr,
+  //              "[geminifs] launch_remote_io_xfer: kernel launched (is_read=%d "
+  //              "size=%lu)\n",
+  //              static_cast<int>(is_read), static_cast<unsigned long>(size));
+  // std::fflush(stderr);
 }
 
 }  // namespace
