@@ -1045,6 +1045,18 @@ class EngineCoreProc(EngineCore):
         engine_core: EngineCoreProc | None = None
         try:
             vllm_config: VllmConfig = kwargs["vllm_config"]
+
+            # A spawned EngineCore starts with a stripped environment, so the
+            # GeminiFS KV-offload backend's cuBLAS/CUDA anti-deadlock env vars
+            # (set by the launch shell) never reach the process that runs the
+            # model. Re-apply them here, before the model is loaded and cuBLAS
+            # is first used. No-op unless GeminiFS offloading is configured.
+            from vllm.v1.kv_offload.worker.geminifs import (
+                maybe_setup_geminifs_deadlock_env,
+            )
+
+            maybe_setup_geminifs_deadlock_env(vllm_config)
+
             parallel_config: ParallelConfig = vllm_config.parallel_config
             data_parallel = parallel_config.data_parallel_size > 1 or dp_rank > 0
             if data_parallel:

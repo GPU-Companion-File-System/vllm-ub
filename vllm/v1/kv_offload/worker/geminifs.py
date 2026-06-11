@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 import threading
 from collections import deque
 from dataclasses import dataclass
@@ -36,6 +37,46 @@ _DESC_FIELDS = 5
 # multiple GPU workers racing to build it concurrently.
 _GEMINIFS_SINGLETON: Any = None
 _GEMINIFS_SINGLETON_LOCK = threading.Lock()
+
+
+# Env vars that steer cuBLAS away from SM-cooperative "stream-K" GEMM kernels and
+# keep CUDA module loading eager. GeminiFS' persistent IO daemon kernels hold a
+# few SMs forever, so any kernel that needs ALL SMs co-resident at launch (which
+# is what cuBLAS picks when given a non-zero workspace) can never launch and the
+# GEMM deadlocks; CUDA_MODULE_LOADING=EAGER is required for the daemon's polling
+# kernels. They must be in effect before the first cuBLAS handle is created
+# (i.e. before the engine's profile/warmup forward) and before the CUDA context
+# is created, so they can only be applied as environment variables, not via a
+# runtime API.
+_GEMINIFS_DEADLOCK_ENV = {
+    "CUDA_MODULE_LOADING": "EAGER",
+    "CUBLAS_WORKSPACE_CONFIG": ":0:0",
+    "CUBLASLT_WORKSPACE_SIZE": "0",
+}
+
+
+def maybe_setup_geminifs_deadlock_env(vllm_config: Any) -> None:
+    """Apply the GeminiFS anti-deadlock cuBLAS/CUDA env vars in this process.
+
+    No-op unless ``vllm_config`` actually selects the GeminiFS offload spec.
+
+    In the in-process (offline ``LLM``) path the engine is *forked*, so it
+    inherits these vars from the launching shell. But ``vllm serve`` runs
+    EngineCore in a *spawned* process that starts with a stripped environment
+    (the launch-shell's cuBLAS settings do not reach it), so without this the
+    serve-mode warm query deadlocks on the first eager (non-CUDA-graph) GEMM
+    once the IO daemon is running. Call this at engine-process entry, before the
+    model is loaded / cuBLAS is first used. Uses ``setdefault`` so an explicit
+    value already present in the environment always wins.
+    """
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if kv_transfer_config is None:
+        return
+    extra_config = kv_transfer_config.kv_connector_extra_config or {}
+    if extra_config.get("spec_name") != "GeminifsOffloadingSpec":
+        return
+    for key, value in _GEMINIFS_DEADLOCK_ENV.items():
+        os.environ.setdefault(key, value)
 
 
 def _get_or_create_geminifs(
