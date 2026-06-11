@@ -133,48 +133,31 @@ class PyGeminiFS {
   std::unique_ptr<GeminiFS> fs_;
 };
 
-void launch_remote_io_xfer(uintptr_t client_ctrl_ptr, uintptr_t buffer_ptr,
-                           uint64_t size, uint32_t gpu_file_id,
-                           uint64_t file_offset, bool is_read,
-                           uintptr_t stream_ptr) {
-  NvtxRange nvtx_range("launch_remote_io_xfer");
+void launch_remote_io_xfer_batch(uintptr_t desc_ptr, uint64_t num_descs,
+                                 bool is_read, uintptr_t stream_ptr) {
+  NvtxRange nvtx_range("launch_remote_io_xfer_batch");
 
-  std::fprintf(stderr,
-               "[geminifs] launch_remote_io_xfer: client_ctrl_ptr=0x%lx "
-               "buffer_ptr=0x%lx size=%lu gpu_file_id=%u file_offset=%lu "
-               "is_read=%d stream_ptr=0x%lx\n",
-               static_cast<unsigned long>(client_ctrl_ptr),
-               static_cast<unsigned long>(buffer_ptr),
-               static_cast<unsigned long>(size),
-               static_cast<unsigned int>(gpu_file_id),
-               static_cast<unsigned long>(file_offset),
-               static_cast<int>(is_read),
-               static_cast<unsigned long>(stream_ptr));
-  std::fflush(stderr);
-
-  if (client_ctrl_ptr == 0) {
-    throw std::runtime_error(
-        "launch_remote_io_xfer requires non-zero client_ctrl_ptr");
+  if (num_descs == 0) {
+    return;
   }
-  if (buffer_ptr == 0 && size > 0) {
+  if (desc_ptr == 0) {
     throw std::runtime_error(
-        "launch_remote_io_xfer requires non-zero buffer_ptr when size > 0");
+        "launch_remote_io_xfer_batch requires non-zero desc_ptr");
   }
 
-  auto* client = reinterpret_cast<nvl_queue_client_ctrl_t*>(client_ctrl_ptr);
-  void* buffer = reinterpret_cast<void*>(buffer_ptr);
+  nvl_batch_io_ctx_t ctx;
+  ctx.descs = reinterpret_cast<const nvl_batch_io_desc_t*>(desc_ptr);
+  ctx.num_descs = num_descs;
+  ctx.is_read = is_read;
+
   cudaStream_t stream = reinterpret_cast<cudaStream_t>(stream_ptr);
 
-  deamon_remote_io_xfer_kernel<<<1, 1, 0, stream>>>(
-      client, buffer, static_cast<size_t>(size), gpu_file_id, file_offset,
-      is_read);
-  check_cuda_launch("deamon_remote_io_xfer_kernel");
-
-  // std::fprintf(stderr,
-  //              "[geminifs] launch_remote_io_xfer: kernel launched (is_read=%d "
-  //              "size=%lu)\n",
-  //              static_cast<int>(is_read), static_cast<unsigned long>(size));
-  // std::fflush(stderr);
+  constexpr unsigned int kThreadsPerBlock = 256;
+  unsigned int blocks = static_cast<unsigned int>(
+      (num_descs + kThreadsPerBlock - 1) / kThreadsPerBlock);
+  deamon_remote_io_xfer_batch_kernel<<<blocks, kThreadsPerBlock, 0, stream>>>(
+      ctx);
+  check_cuda_launch("deamon_remote_io_xfer_batch_kernel");
 }
 
 }  // namespace
@@ -205,9 +188,8 @@ PYBIND11_MODULE(geminifs_ops, m) {
       .def("get_client_ctrl_ptr", &PyGeminiFS::get_client_ctrl_ptr,
            py::arg("client_gpu_id"), py::arg("server_gpu_id"));
 
-  m.def("launch_remote_io_xfer", &launch_remote_io_xfer,
-        py::arg("client_ctrl_ptr"), py::arg("buffer_ptr"), py::arg("size"),
-        py::arg("gpu_file_id"), py::arg("file_offset"), py::arg("is_read"),
+  m.def("launch_remote_io_xfer_batch", &launch_remote_io_xfer_batch,
+        py::arg("desc_ptr"), py::arg("num_descs"), py::arg("is_read"),
         py::arg("stream_ptr") = 0,
         py::call_guard<py::gil_scoped_release>());
 }

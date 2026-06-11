@@ -23,6 +23,12 @@ from vllm.v1.kv_offload.worker.worker import (
 
 logger = init_logger(__name__)
 
+# Number of int64 fields per batched IO descriptor. Must match the layout the
+# GeminiFS batched kernel reads (see launch_remote_io_xfer_batch):
+#   [0] client_ctrl_ptr  [1] buffer_ptr  [2] size
+#   [3] gpu_file_id       [4] file_offset
+_DESC_FIELDS = 5
+
 # A single GeminiFS instance must back every GPU in the process: the underlying
 # device-side IO daemon and shared control state can only be set up once. This
 # mirrors a C file-scope static singleton — the first caller constructs it and
@@ -61,6 +67,8 @@ class GeminifsTransfer:
     start_event: torch.Event
     end_event: torch.Event
     num_bytes: int
+    host_desc: torch.Tensor
+    device_desc: torch.Tensor
 
 
 class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
@@ -80,11 +88,12 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
         gpu_tensors: list[torch.Tensor],
         gpu_block_size_factor: int,
         geminifs_block_size_factor: int,
-        launch_remote_io_xfer: Any,
+        launch_remote_io_xfer_batch: Any,
         client_ctrl_ptrs: list[int],
         gpu_file_ids: list[int],
         is_read: bool,
         stream_pool_size: int,
+        max_descs_per_transfer: int,
         ensure_daemon_launched: Any,
     ):
         assert gpu_tensors
@@ -112,7 +121,7 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
             offset += block_bytes
         self.total_gpu_block_size_in_bytes = offset
 
-        self.launch_remote_io_xfer = launch_remote_io_xfer
+        self.launch_remote_io_xfer_batch = launch_remote_io_xfer_batch
         # One client control pointer per server storage backend. With a single
         # entry every block targets that one server (no striping). With multiple
         # entries, offloaded blocks are striped round-robin across the servers by
@@ -148,6 +157,31 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
         self._event_pool: list[torch.Event] = [
             torch.Event(enable_timing=True) for _ in range(2 * stream_pool_size)
         ]
+        # Per-transfer IO descriptor staging buffers, one pinned-host + device
+        # pair per stream. A single transfer_async builds all its (client,
+        # buffer, size, file, offset) descriptors into one of these and hands the
+        # device buffer to a single batched kernel launch. Like streams/events,
+        # these MUST be allocated before the daemon launches: once it runs, the
+        # driver blocks cudaMalloc / cudaHostAlloc forever. max_descs_per_transfer
+        # bounds the largest batch (see GpuGeminifsOffloadingHandlers); a single
+        # request can never exceed it.
+        self.max_descs_per_transfer = max_descs_per_transfer
+        self._host_desc_pool: list[torch.Tensor] = [
+            torch.empty(
+                (max_descs_per_transfer, _DESC_FIELDS),
+                dtype=torch.int64,
+                pin_memory=True,
+            )
+            for _ in range(stream_pool_size)
+        ]
+        self._device_desc_pool: list[torch.Tensor] = [
+            torch.empty(
+                (max_descs_per_transfer, _DESC_FIELDS),
+                dtype=torch.int64,
+                device=gpu_tensors[0].device,
+            )
+            for _ in range(stream_pool_size)
+        ]
         # Results of transfers that were force-drained (below) to free pooled
         # streams/events; returned on the next get_finished() call.
         self._drained_results: list[TransferResult] = []
@@ -177,6 +211,8 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
         self._stream_pool.append(transfer.stream)
         self._event_pool.append(transfer.end_event)
         self._event_pool.append(transfer.start_event)
+        self._host_desc_pool.append(transfer.host_desc)
+        self._device_desc_pool.append(transfer.device_desc)
         del self._transfer_events[transfer.job_id]
 
     def _acquire_stream(self) -> torch.cuda.Stream:
@@ -201,6 +237,30 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
             self._recycle_oldest_blocking()
         return self._event_pool.pop()
 
+    def _acquire_desc(self) -> tuple[torch.Tensor, torch.Tensor]:
+        # Host and device descriptor pools are sized and recycled in lockstep
+        # with the stream pool, so a stream is always available alongside a
+        # descriptor pair. We cannot allocate new ones while the daemon runs.
+        while not self._host_desc_pool:
+            if not self._transfers:
+                logger.warning(
+                    "GeminiFS descriptor pool exhausted with no in-flight transfers"
+                )
+                return (
+                    torch.empty(
+                        (self.max_descs_per_transfer, _DESC_FIELDS),
+                        dtype=torch.int64,
+                        pin_memory=True,
+                    ),
+                    torch.empty(
+                        (self.max_descs_per_transfer, _DESC_FIELDS),
+                        dtype=torch.int64,
+                        device=self.gpu_tensors[0].device,
+                    ),
+                )
+            self._recycle_oldest_blocking()
+        return self._host_desc_pool.pop(), self._device_desc_pool.pop()
+
     def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
         # Launch the persistent IO daemon kernels lazily, on the first transfer,
         # so that all CUDA resource allocation (vLLM warmup + the pools above)
@@ -223,21 +283,68 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
         sub_block_count = geminifs_blocks.size * self.geminifs_block_size_factor
         assert sub_block_count == gpu_blocks.size
 
-        block_pairs = np.empty((sub_block_count, 2), dtype=np.int64)
-        block_pairs[:, 0] = gpu_blocks
+        gpu_block_ids = np.asarray(gpu_blocks, dtype=np.int64)
+        geminifs_block_ids = np.empty(sub_block_count, dtype=np.int64)
         expand_block_ids(
             geminifs_blocks,
             self.geminifs_block_size_factor,
-            block_pairs[:, 1],
+            geminifs_block_ids,
         )
+
+        # Build the full IO descriptor table for this request in one shot, then
+        # hand it to a single batched kernel launch. Each (GPU sub-block) x
+        # (registered tensor) pair is one descriptor row; layout matches the
+        # kernel (see launch_remote_io_xfer_batch / _DESC_FIELDS):
+        #   [client_ctrl_ptr, buffer_ptr, size, gpu_file_id, file_offset]
+        num_tensors = len(self.gpu_tensors)
+        num_descs = sub_block_count * num_tensors
+        # The connector issues one transfer per request, so a single batch can
+        # never exceed the per-request bound the pools were sized for.
+        assert num_descs <= self.max_descs_per_transfer, (
+            f"GeminiFS batch of {num_descs} descriptors exceeds "
+            f"max_descs_per_transfer={self.max_descs_per_transfer}"
+        )
+
+        offloaded_file_idx = geminifs_block_ids // self.geminifs_block_size_factor
+        file_block_idx = geminifs_block_ids % self.geminifs_block_size_factor
+        # Per-sub-block server backend (round-robin striping by offloaded block
+        # idx) and target GPU file. With a single client pointer this is always
+        # index 0 (no striping, original behavior). Because the idx alone selects
+        # the backend, a store and its later read always land on the same server.
+        client_per_block = np.asarray(self.client_ctrl_ptrs, dtype=np.int64)[
+            offloaded_file_idx % len(self.client_ctrl_ptrs)
+        ]
+        gpu_file_id_per_block = np.asarray(self.gpu_file_ids, dtype=np.int64)[
+            offloaded_file_idx
+        ]
+        file_base_offset = file_block_idx * self.total_gpu_block_size_in_bytes
+
+        desc = np.empty((sub_block_count, num_tensors, _DESC_FIELDS), dtype=np.int64)
+        for j, (tensor, tensor_offset, block_bytes) in enumerate(
+            zip(self.gpu_tensors, self.tensor_file_offsets, self.block_size_in_bytes)
+        ):
+            desc[:, j, 0] = client_per_block
+            # block_bytes is the per-GPU-block byte size of this tensor (already
+            # includes gpu_block_size_factor); consecutive GPU blocks are exactly
+            # block_bytes apart, so this is the correct GPU-block byte offset.
+            desc[:, j, 1] = tensor.data_ptr() + gpu_block_ids * block_bytes
+            desc[:, j, 2] = block_bytes
+            desc[:, j, 3] = gpu_file_id_per_block
+            desc[:, j, 4] = file_base_offset + tensor_offset
+        desc = desc.reshape(num_descs, _DESC_FIELDS)
 
         # Use the same stream/event model as the CPU offload handler so the
         # connector can poll completions without blocking the engine step.
-        # Streams/events come from the pre-created pools (never allocated while
-        # the daemon runs); see _acquire_* / _recycle_oldest_blocking.
+        # Streams/events/descriptor buffers come from the pre-created pools (never
+        # allocated while the daemon runs); see _acquire_* / _recycle_oldest_blocking.
         stream = self._acquire_stream()
         start_event = self._acquire_event()
         end_event = self._acquire_event()
+        host_desc, device_desc = self._acquire_desc()
+
+        # Stage descriptors into pinned host memory, then async-copy to the device
+        # buffer on the transfer stream so the batched kernel reads them there.
+        host_desc[:num_descs].copy_(torch.from_numpy(desc))
 
         if not self.is_read:
             # Stores must wait until model kernels have finished producing the
@@ -250,49 +357,16 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
         with torch.cuda.stream(stream):
             start_event.record(stream)
             stream_ptr = int(stream.cuda_stream)
-            for gpu_block_id, geminifs_block_id in block_pairs:
-                offloaded_file_idx = (
-                    int(geminifs_block_id) // self.geminifs_block_size_factor
-                )
-                file_block_idx = (
-                    int(geminifs_block_id) % self.geminifs_block_size_factor
-                )
-                gpu_file_id = self.gpu_file_ids[offloaded_file_idx]
-                # Stripe offloaded blocks round-robin across server backends by
-                # offloaded block idx: with 2 backends, block 0 -> backend 0,
-                # block 1 -> backend 1, block 2 -> backend 0, ... Because the idx
-                # alone selects the backend, a store and its later read always
-                # land on the same server. With a single client pointer this
-                # always selects index 0 (no striping, original behavior).
-                client_ctrl_ptr = self.client_ctrl_ptrs[
-                    offloaded_file_idx % len(self.client_ctrl_ptrs)
-                ]
-                file_base_offset = (
-                    file_block_idx * self.total_gpu_block_size_in_bytes
-                )
-                for tensor, tensor_offset, block_bytes in zip(
-                    self.gpu_tensors,
-                    self.tensor_file_offsets,
-                    self.block_size_in_bytes,
-                ):
-                    # block_bytes is the per-GPU-block byte size of this
-                    # tensor (already includes gpu_block_size_factor), and
-                    # consecutive GPU blocks are exactly block_bytes apart in
-                    # the tensor, so this is the correct GPU-block byte offset.
-                    buffer_ptr = tensor.data_ptr() + int(gpu_block_id) * block_bytes
-                    file_offset = file_base_offset + tensor_offset
-                    # GeminiFS receives explicit GPU virtual addresses and file
-                    # offsets. The pybind function launches the device-side IO
-                    # request on the stream above.
-                    self.launch_remote_io_xfer(
-                        client_ctrl_ptr,
-                        buffer_ptr,
-                        int(block_bytes),
-                        gpu_file_id,
-                        int(file_offset),
-                        self.is_read,
-                        stream_ptr,
-                    )
+            device_desc[:num_descs].copy_(host_desc[:num_descs], non_blocking=True)
+            # One launch issues every descriptor's IO request; GeminiFS reads the
+            # explicit (client, GPU vaddr, size, file, offset) tuples from the
+            # device descriptor buffer on the stream above.
+            self.launch_remote_io_xfer_batch(
+                device_desc.data_ptr(),
+                num_descs,
+                self.is_read,
+                stream_ptr,
+            )
             end_event.record(stream)
 
         self._transfer_events[job_id] = end_event
@@ -304,6 +378,8 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
                 end_event=end_event,
                 num_bytes=sub_block_count
                 * self.total_gpu_block_size_in_bytes,
+                host_desc=host_desc,
+                device_desc=device_desc,
             )
         )
         return True
@@ -329,6 +405,8 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
             self._stream_pool.append(transfer.stream)
             self._event_pool.append(transfer.end_event)
             self._event_pool.append(transfer.start_event)
+            self._host_desc_pool.append(transfer.host_desc)
+            self._device_desc_pool.append(transfer.device_desc)
             del self._transfer_events[transfer.job_id]
         return results
 
@@ -485,6 +563,23 @@ class GpuGeminifsOffloadingHandlers:
         # concurrently without blocking; see SingleDirectionGeminifsOffloadingHandler.
         stream_pool_size = int(extra_config.get("geminifs_stream_pool_size", 32))
 
+        # Upper bound on IO descriptors a single transfer can produce, used to
+        # pre-size the per-stream descriptor staging buffers (which, like
+        # streams/events, must be allocated before the daemon launches). The
+        # connector issues one transfer per request, and a request loads/stores
+        # at most ceil(max_model_len / gpu_block_size) GPU blocks; each GPU block
+        # contributes one descriptor per registered tensor. max_model_len is
+        # taken from kv_connector_extra_config to keep this worker decoupled from
+        # the full VllmConfig; if absent we fall back to a generous default.
+        max_model_len = int(extra_config.get("geminifs_max_model_len", 131072))
+        max_gpu_blocks_per_req = -(-max_model_len // gpu_block_size)  # ceil-div
+        max_descs_per_transfer = int(
+            extra_config.get(
+                "geminifs_max_descs_per_transfer",
+                max_gpu_blocks_per_req * len(gpu_tensors),
+            )
+        )
+
         logger.info(
             "Initializing GeminiFS KV offload: files=%d, file_bytes=%d",
             num_geminifs_blocks,
@@ -541,21 +636,23 @@ class GpuGeminifsOffloadingHandlers:
             gpu_tensors=gpu_tensors,
             gpu_block_size_factor=gpu_block_size_factor,
             geminifs_block_size_factor=geminifs_block_size_factor,
-            launch_remote_io_xfer=geminifs_ops.launch_remote_io_xfer,
+            launch_remote_io_xfer_batch=geminifs_ops.launch_remote_io_xfer_batch,
             client_ctrl_ptrs=self.client_ctrl_ptrs,
             gpu_file_ids=self.gpu_file_ids,
             is_read=False,
             stream_pool_size=stream_pool_size,
+            max_descs_per_transfer=max_descs_per_transfer,
             ensure_daemon_launched=ensure_daemon_launched,
         )
         self.geminifs_to_gpu_handler = SingleDirectionGeminifsOffloadingHandler(
             gpu_tensors=gpu_tensors,
             gpu_block_size_factor=gpu_block_size_factor,
             geminifs_block_size_factor=geminifs_block_size_factor,
-            launch_remote_io_xfer=geminifs_ops.launch_remote_io_xfer,
+            launch_remote_io_xfer_batch=geminifs_ops.launch_remote_io_xfer_batch,
             client_ctrl_ptrs=self.client_ctrl_ptrs,
             gpu_file_ids=self.gpu_file_ids,
             is_read=True,
             stream_pool_size=stream_pool_size,
+            max_descs_per_transfer=max_descs_per_transfer,
             ensure_daemon_launched=ensure_daemon_launched,
         )

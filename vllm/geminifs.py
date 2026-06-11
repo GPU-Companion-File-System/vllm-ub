@@ -10,7 +10,7 @@ and raises a clear error when the extension is unavailable.
 
 from typing import TYPE_CHECKING
 
-__all__ = ["GeminiFS", "launch_remote_io_xfer"]
+__all__ = ["GeminiFS", "launch_remote_io_xfer_batch"]
 
 _IMPORT_ERROR_HINT = (
     "The GeminiFS extension (vllm.geminifs_ops) is not available. It is an "
@@ -20,9 +20,9 @@ _IMPORT_ERROR_HINT = (
 )
 
 if TYPE_CHECKING:
-    from vllm.geminifs_ops import GeminiFS, launch_remote_io_xfer
+    from vllm.geminifs_ops import GeminiFS, launch_remote_io_xfer_batch
 else:
     try:
-        from vllm.geminifs_ops import GeminiFS, launch_remote_io_xfer
+        from vllm.geminifs_ops import GeminiFS, launch_remote_io_xfer_batch
     except ImportError as exc:  # pragma: no cover - depends on build config
         raise ImportError(_IMPORT_ERROR_HINT) from exc
