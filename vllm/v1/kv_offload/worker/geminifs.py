@@ -101,6 +101,52 @@ def _get_or_create_geminifs(
     return _GEMINIFS_SINGLETON
 
 
+class _DaemonController:
+    """Process-wide refcounted controller for the GeminiFS IO daemon kernels.
+
+    The persistent device-side IO daemon server kernels permanently occupy a few
+    GPU SMs while running. Any SM-cooperative cuBLAS GEMM (stream-K) needs ALL
+    SMs co-resident at launch, so while the daemon runs such a GEMM can never
+    launch and the model forward deadlocks (see ``_GEMINIFS_DEADLOCK_ENV``). The
+    persistent-mode mitigations (deferred launch, CUDA graphs, single-forward
+    prefill) only avoid this as long as no *eager* GEMM ever overlaps the daemon
+    -- which a chunked prefill still does.
+
+    In on-demand mode the daemon is instead brought up only for the duration of a
+    single KV transfer and torn down immediately after (the transfer is fully
+    awaited before the teardown), so the daemon is never resident while the
+    model's GEMMs run and the deadlock cannot occur regardless of chunking. The
+    underlying GeminiFS instance is a process-wide singleton, so this controller
+    is too: a single refcount guards launch/stop across both transfer directions.
+    The daemon is launched on the 0->1 transition and stopped on the 1->0
+    transition; ``is_io_deamon_kernel_launched()`` is the authoritative state.
+    """
+
+    def __init__(self, geminifs: Any):
+        self._geminifs = geminifs
+        self._lock = threading.Lock()
+        self._refcount = 0
+
+    def acquire(self) -> None:
+        """Ensure the daemon is running for an in-flight transfer (refcounted)."""
+        with self._lock:
+            if self._refcount == 0 and (
+                not self._geminifs.is_io_deamon_kernel_launched()
+            ):
+                self._geminifs.launch_io_deamon_kernels()
+            self._refcount += 1
+
+    def release(self) -> None:
+        """Release one in-flight transfer; stop the daemon when none remain."""
+        with self._lock:
+            assert self._refcount > 0, "GeminiFS daemon refcount underflow"
+            self._refcount -= 1
+            if self._refcount == 0 and (
+                self._geminifs.is_io_deamon_kernel_launched()
+            ):
+                self._geminifs.stop_io_deamon_kernels()
+
+
 @dataclass
 class GeminifsTransfer:
     job_id: int
@@ -136,6 +182,8 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
         stream_pool_size: int,
         max_descs_per_transfer: int,
         ensure_daemon_launched: Any,
+        on_demand: bool = False,
+        daemon_controller: Any = None,
     ):
         assert gpu_tensors
         self.gpu_tensors = gpu_tensors
@@ -188,6 +236,12 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
         # first transfer, i.e. after vLLM has finished warming up the allocator
         # and cuBLAS. Once these resources exist, reusing them is safe.
         self._ensure_daemon_launched = ensure_daemon_launched
+        # On-demand mode: the daemon is launched per transfer and stopped right
+        # after, so transfers run synchronously (see transfer_async). Otherwise
+        # the daemon is launched once (lazily) and left running.
+        self._on_demand = on_demand
+        self._daemon_controller = daemon_controller
+        assert not on_demand or daemon_controller is not None
         self._transfer_events: dict[int, torch.Event] = {}
         self._transfers: deque[GeminifsTransfer] = deque()
         # Pre-created, never grown after the daemon launches.
@@ -303,10 +357,38 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
         return self._host_desc_pool.pop(), self._device_desc_pool.pop()
 
     def transfer_async(self, job_id: int, transfer_spec: TransferSpec) -> bool:
-        # Launch the persistent IO daemon kernels lazily, on the first transfer,
-        # so that all CUDA resource allocation (vLLM warmup + the pools above)
-        # has already completed.
+        if self._on_demand:
+            # Bring the IO daemon up only for this transfer, issue it, fully wait
+            # for it, then tear the daemon down -- so control returns to the
+            # engine (its next forward / cuBLAS GEMM) with the SMs free again and
+            # the daemon never coexists with a GEMM. This makes the transfer
+            # synchronous; its result is stashed and reported on the next
+            # get_finished() (same path as a force-drained transfer).
+            self._daemon_controller.acquire()
+            try:
+                self._do_transfer(job_id, transfer_spec)
+                # The just-issued transfer is the only one in flight; block on it
+                # and recycle its pooled resources before stopping the daemon.
+                self._recycle_oldest_blocking()
+            finally:
+                self._daemon_controller.release()
+            return True
+
+        # Persistent mode: launch the daemon lazily on the first transfer, after
+        # all CUDA resource allocation (vLLM warmup + the pools above) has
+        # completed, then leave it running for the lifetime of the process.
         self._ensure_daemon_launched()
+        self._do_transfer(job_id, transfer_spec)
+        return True
+
+    def _do_transfer(self, job_id: int, transfer_spec: TransferSpec) -> None:
+        """Build and asynchronously issue one transfer, recording its events.
+
+        Stages descriptors and launches the batched IO kernel on a pooled stream;
+        the transfer is tracked in ``self._transfers`` and completes
+        asynchronously. Callers either poll completion via get_finished()
+        (persistent mode) or block immediately (on-demand mode).
+        """
         src_spec, dst_spec = transfer_spec
         if self.is_read:
             assert isinstance(src_spec, GeminifsLoadStoreSpec)
@@ -423,7 +505,6 @@ class SingleDirectionGeminifsOffloadingHandler(OffloadingHandler):
                 device_desc=device_desc,
             )
         )
-        return True
 
     def get_finished(self) -> list[TransferResult]:
         # Include any transfers that were force-drained to free pooled resources.
@@ -604,6 +685,14 @@ class GpuGeminifsOffloadingHandlers:
         # concurrently without blocking; see SingleDirectionGeminifsOffloadingHandler.
         stream_pool_size = int(extra_config.get("geminifs_stream_pool_size", 32))
 
+        # On-demand daemon: launch the IO daemon only for the duration of each KV
+        # transfer and stop it immediately after, instead of launching it once
+        # and leaving it spinning. This trades the transfer/compute overlap of
+        # the persistent daemon for guaranteed deadlock-freedom: the daemon never
+        # holds SMs while the model runs a (possibly eager, chunked-prefill)
+        # cuBLAS GEMM. See _DaemonController / SingleDirectionGeminifsOffloadingHandler.
+        on_demand_daemon = bool(extra_config.get("geminifs_on_demand_daemon", False))
+
         # Upper bound on IO descriptors a single transfer can produce, used to
         # pre-size the per-stream descriptor staging buffers (which, like
         # streams/events, must be allocated before the daemon launches). The
@@ -655,6 +744,11 @@ class GpuGeminifsOffloadingHandlers:
                 server_gpu_ids,
             )
 
+        # Refcounted controller shared by both direction handlers; only used in
+        # on-demand mode (in persistent mode the daemon is launched once via
+        # ensure_daemon_launched below).
+        daemon_controller = _DaemonController(self.geminifs)
+
         daemon_launch_lock = threading.Lock()
 
         def ensure_daemon_launched() -> None:
@@ -684,6 +778,8 @@ class GpuGeminifsOffloadingHandlers:
             stream_pool_size=stream_pool_size,
             max_descs_per_transfer=max_descs_per_transfer,
             ensure_daemon_launched=ensure_daemon_launched,
+            on_demand=on_demand_daemon,
+            daemon_controller=daemon_controller,
         )
         self.geminifs_to_gpu_handler = SingleDirectionGeminifsOffloadingHandler(
             gpu_tensors=gpu_tensors,
@@ -696,4 +792,6 @@ class GpuGeminifsOffloadingHandlers:
             stream_pool_size=stream_pool_size,
             max_descs_per_transfer=max_descs_per_transfer,
             ensure_daemon_launched=ensure_daemon_launched,
+            on_demand=on_demand_daemon,
+            daemon_controller=daemon_controller,
         )
