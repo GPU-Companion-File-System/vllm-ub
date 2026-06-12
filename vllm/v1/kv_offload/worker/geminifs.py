@@ -182,6 +182,63 @@ def maybe_warmup_geminifs_daemon_gemms(vllm_config: Any, model_runner: Any) -> N
     torch.cuda.synchronize()
     logger.info("GeminiFS persistent-daemon warm-up complete (%d forwards)", len(sizes))
 
+    # The body sweep above runs only the model forward (hidden states) -- it never
+    # calls compute_logits, so the eager lm_head GEMM (an extern cuBLAS matmul run
+    # AFTER the forward, never inside a CUDA graph) is left un-warmed. Its M axis
+    # is the number of sampled tokens in a step (one logit per request, so
+    # <= max_num_seqs), a DIFFERENT axis from the body token count, so it needs its
+    # own sweep. Skipping it re-deadlocks the instant a step samples a request
+    # count whose lm_head algo-config was never loaded -- exactly the cache-hit
+    # path, where a burst of restored requests samples in one step at a count the
+    # all-miss warm-up never produced.
+    _warmup_lm_head_gemm(vllm_config, model_runner, step)
+
+
+def _warmup_lm_head_gemm(vllm_config: Any, model_runner: Any, step: int) -> None:
+    """Pre-execute the eager lm_head GEMM for every sampled-token count it can hit.
+
+    A step computes logits for the last token of each sampled request, so the
+    lm_head matmul's row count is in ``[1, max_num_seqs]``. Sweep every count
+    (step 1 by default) because, like the body GEMMs, adjacent M can map to
+    different cuBLAS algo-configs. This is cheap -- one thin matmul per count
+    against a dummy hidden-state buffer -- and runs in the same daemon-free
+    warm-up window as the body sweep.
+    """
+    model = getattr(model_runner, "model", None)
+    compute_logits = getattr(model, "compute_logits", None)
+    if compute_logits is None:
+        logger.warning(
+            "GeminiFS lm_head warm-up skipped: model has no compute_logits; the "
+            "lm_head GEMM may lazy-load under the daemon and deadlock"
+        )
+        return
+
+    max_num_seqs = max(1, int(vllm_config.scheduler_config.max_num_seqs))
+    hidden_size = int(vllm_config.model_config.get_hidden_size())
+    dtype = vllm_config.model_config.dtype
+    device = model_runner.device
+
+    sizes = list(range(1, max_num_seqs + 1, step))
+    if sizes[-1] != max_num_seqs:
+        sizes.append(max_num_seqs)
+
+    logger.info(
+        "GeminiFS persistent-daemon warm-up: pre-executing the lm_head GEMM for "
+        "%d sampled-token counts (1..%d, step %d) -- _dummy_run never runs it",
+        len(sizes),
+        max_num_seqs,
+        step,
+    )
+    # One buffer sized for the largest count; slice per count so a single
+    # allocation covers the whole sweep (and happens before the daemon launches).
+    hidden = torch.empty((max_num_seqs, hidden_size), dtype=dtype, device=device)
+    for num_logits in sizes:
+        compute_logits(hidden[:num_logits])
+    torch.cuda.synchronize()
+    logger.info(
+        "GeminiFS lm_head warm-up complete (%d sampled-token counts)", len(sizes)
+    )
+
 
 def _get_or_create_geminifs(
     geminifs_ops: Any,

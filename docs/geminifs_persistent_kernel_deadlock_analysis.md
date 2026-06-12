@@ -236,6 +236,33 @@ forward it also preloads custom/Triton kernels, not just cuBLAS. (An optimized
 variant enumerates the distinct algo-configs per shape via the heuristic scan and
 warms one M each, ~300 GEMMs.)
 
+**The body sweep alone is INSUFFICIENT — the lm_head GEMM is a second axis
+(found + fixed 2026-06-12).** The recipe above warms the model *body* GEMMs by
+running dummy forwards, but vLLM's `_dummy_run` stops at the hidden states — it
+**never calls `compute_logits`**, so the eager `lm_head` GEMM (an `extern_kernels`
+cuBLAS matmul run *after* the forward, never inside a CUDA graph) is left
+un-warmed. Its row count M is the number of **sampled tokens in a step** (one
+logit per request → `M ≤ max_num_seqs`), a *different* axis from the body token
+count, and it maps to its own set of cuBLAS algo-configs (~26 over M∈[1,2048] for
+Llama-3-8B's `[vocab, hidden]` shape). The body sweep therefore preloads none of
+them. The all-miss case survives only by luck: the first sampling step runs before
+the daemon launches on the first KV store, preloading whatever sampling-count the
+steady state happens to use. The **cache-hit (SSD load) path breaks it**: a burst
+of restored requests becomes ready to sample in a single step at a count the
+all-miss warm-up never produced, so the `lm_head` GEMM of that count lazy-loads
+under the resident daemon and hangs — py-spy froze at
+`compute_logits → logits_processor._get_logits → default_unquantized_gemm`
+(`utils.py:98`), the lm_head matmul, *not* a body GEMM.
+
+Fix: after the body sweep, run a **second sweep that calls `compute_logits` on a
+dummy `[M, hidden]` buffer for every M in `[1, max_num_seqs]`**, preloading the
+lm_head algo-configs in the same daemon-free window
+(`maybe_warmup_geminifs_daemon_gemms` → `_warmup_lm_head_gemm`). Cost is trivial
+(one thin matmul per count; `max_num_seqs` is O(10²–10³)). Verified 2026-06-12
+(Qwen3-8B, persistent daemon + warm-up, the cache-hit throughput sweep that
+previously hung): hit=50 → 27,136 tok/s and hit=100 → 100,624 tok/s, both clean
+where the body-only warm-up deadlocked the instant SSD loads entered.
+
 **Trade-off vs the on-demand daemon (`1c0e4fb`).** Warm-up is the one option that
 keeps the daemon *persistent* — so it **retains transfer/compute overlap**, which
 the on-demand daemon gives up. Cost is a sub-second one-time warm-up plus the
