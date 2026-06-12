@@ -602,6 +602,17 @@ class Worker(WorkerBase):
             else:
                 self.model_runner._dummy_sampler_run(hidden_states=last_hidden_states)
 
+        # GeminiFS persistent-daemon warm-up: if enabled, pre-execute every eager
+        # GEMM shape a chunked-prefill forward can hit, so none has to lazy-load
+        # its cuBLAS cubin against the spinning IO daemon later (which deadlocks).
+        # Runs here, after capture, while the GPU can still quiesce and before the
+        # daemon goes resident on the first KV transfer. No-op unless enabled.
+        from vllm.v1.kv_offload.worker.geminifs import (
+            maybe_warmup_geminifs_daemon_gemms,
+        )
+
+        maybe_warmup_geminifs_daemon_gemms(self.vllm_config, self.model_runner)
+
         # Reset the seed to ensure that the random state is not affected by
         # the model initialization and profiling.
         set_random_seed(self.model_config.seed)

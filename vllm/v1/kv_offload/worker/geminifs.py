@@ -79,6 +79,110 @@ def maybe_setup_geminifs_deadlock_env(vllm_config: Any) -> None:
         os.environ.setdefault(key, value)
 
 
+# Extra-config key enabling the persistent-daemon GEMM warm-up fix. With the
+# persistent IO daemon, an eager (chunked-prefill) GEMM whose cuBLAS kernel was
+# never warmed has to lazy-load its cubin while the daemon spins, which needs a
+# device-idle point the daemon denies -> deadlock. Warm-up pre-executes every
+# such GEMM before the daemon goes resident, so none has to lazy-load against the
+# spin. See docs/geminifs_persistent_kernel_deadlock_analysis.md (section 8).
+# This is an alternative to the on-demand daemon: it keeps the daemon persistent
+# (retaining transfer/compute overlap) at the cost of a one-time startup sweep.
+_GEMINIFS_WARMUP_FLAG = "geminifs_warmup_daemon"
+
+
+def _geminifs_extra_config(vllm_config: Any) -> dict[str, Any] | None:
+    """Return the GeminiFS kv_connector_extra_config, or None if not selected."""
+    kv_transfer_config = getattr(vllm_config, "kv_transfer_config", None)
+    if kv_transfer_config is None:
+        return None
+    extra_config = kv_transfer_config.kv_connector_extra_config or {}
+    if extra_config.get("spec_name") != "GeminifsOffloadingSpec":
+        return None
+    return extra_config
+
+
+def geminifs_daemon_warmup_enabled(vllm_config: Any) -> bool:
+    """True if persistent-daemon GEMM warm-up is requested for this config.
+
+    Warm-up only matters for the persistent daemon: the on-demand daemon
+    (``geminifs_on_demand_daemon``) is deadlock-proof by construction and needs
+    no warm-up, so it takes precedence and disables this path.
+    """
+    extra_config = _geminifs_extra_config(vllm_config)
+    if extra_config is None:
+        return False
+    if bool(extra_config.get("geminifs_on_demand_daemon", False)):
+        return False
+    return bool(extra_config.get(_GEMINIFS_WARMUP_FLAG, False))
+
+
+def maybe_warmup_geminifs_daemon_gemms(vllm_config: Any, model_runner: Any) -> None:
+    """Pre-execute every eager GEMM shape a chunked-prefill forward can hit.
+
+    Runs one eager (CUDA-graph-bypassed) dummy forward per token count in
+    ``[1, max_num_batched_tokens]`` so the first-use lazy load of every cuBLAS
+    algo-config happens now -- while the GPU can still quiesce -- i.e. before the
+    persistent IO daemon goes resident on the first KV transfer. After this no
+    model GEMM ever has to lazy-load against the spinning daemon, so the
+    chunked-prefill deadlock cannot occur. Cost is a one-time startup sweep.
+
+    Must be called during model warm-up (before the first KV transfer launches
+    the daemon). No-op unless warm-up is enabled for this config.
+
+    The sweep is exhaustive (step 1) by default because adjacent token counts can
+    map to different cuBLAS algo-configs, so a coarse grid would leave gaps that
+    re-deadlock. ``geminifs_warmup_step`` and ``geminifs_warmup_max_tokens`` can
+    narrow the sweep for experimentation, at the risk of an uncovered shape.
+    """
+    if not geminifs_daemon_warmup_enabled(vllm_config):
+        return
+
+    # Imported lazily so the module stays importable without a CUDA build.
+    from vllm.config import CUDAGraphMode
+
+    extra_config = _geminifs_extra_config(vllm_config) or {}
+    max_num_batched_tokens = int(
+        vllm_config.scheduler_config.max_num_batched_tokens
+    )
+    max_tokens = int(
+        extra_config.get("geminifs_warmup_max_tokens", max_num_batched_tokens)
+    )
+    # Any single forward's token count is <= max_num_batched_tokens, so there is
+    # nothing to gain (and correctness to lose) by sweeping past it.
+    max_tokens = max(1, min(max_tokens, max_num_batched_tokens))
+    step = max(1, int(extra_config.get("geminifs_warmup_step", 1)))
+
+    sizes = list(range(1, max_tokens + 1, step))
+    # Always cover the largest full chunk even when step does not divide it.
+    if sizes[-1] != max_tokens:
+        sizes.append(max_tokens)
+
+    logger.info(
+        "GeminiFS persistent-daemon warm-up: pre-executing %d eager forwards "
+        "(token counts 1..%d, step %d) to preload all cuBLAS GEMM kernels before "
+        "the IO daemon goes resident",
+        len(sizes),
+        max_tokens,
+        step,
+    )
+    log_every = max(1, len(sizes) // 8)
+    for idx, num_tokens in enumerate(sizes):
+        model_runner._dummy_run(
+            num_tokens,
+            cudagraph_runtime_mode=CUDAGraphMode.NONE,
+            skip_eplb=True,
+        )
+        if (idx + 1) % log_every == 0:
+            logger.info(
+                "GeminiFS warm-up progress: %d/%d forwards (token count %d)",
+                idx + 1,
+                len(sizes),
+                num_tokens,
+            )
+    torch.cuda.synchronize()
+    logger.info("GeminiFS persistent-daemon warm-up complete (%d forwards)", len(sizes))
+
+
 def _get_or_create_geminifs(
     geminifs_ops: Any,
     config_file_path: str,
