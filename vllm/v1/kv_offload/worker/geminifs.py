@@ -79,7 +79,7 @@ def maybe_setup_geminifs_deadlock_env(vllm_config: Any) -> None:
         os.environ.setdefault(key, value)
 
 
-# Extra-config key enabling the persistent-daemon GEMM warm-up fix. With the
+# Extra-config key gating the persistent-daemon GEMM warm-up fix. With the
 # persistent IO daemon, an eager (chunked-prefill) GEMM whose cuBLAS kernel was
 # never warmed has to lazy-load its cubin while the daemon spins, which needs a
 # device-idle point the daemon denies -> deadlock. Warm-up pre-executes every
@@ -87,7 +87,12 @@ def maybe_setup_geminifs_deadlock_env(vllm_config: Any) -> None:
 # spin. See docs/geminifs_persistent_kernel_deadlock_analysis.md (section 8).
 # This is an alternative to the on-demand daemon: it keeps the daemon persistent
 # (retaining transfer/compute overlap) at the cost of a one-time startup sweep.
+#
+# Default ON for the GeminiFS path (the persistent daemon would otherwise
+# re-deadlock on the first un-warmed chunked-prefill GEMM); set this flag to
+# false in kv_connector_extra_config to opt out. See _GEMINIFS_WARMUP_DEFAULT.
 _GEMINIFS_WARMUP_FLAG = "geminifs_warmup_daemon"
+_GEMINIFS_WARMUP_DEFAULT = True
 
 
 def _geminifs_extra_config(vllm_config: Any) -> dict[str, Any] | None:
@@ -102,7 +107,12 @@ def _geminifs_extra_config(vllm_config: Any) -> dict[str, Any] | None:
 
 
 def geminifs_daemon_warmup_enabled(vllm_config: Any) -> bool:
-    """True if persistent-daemon GEMM warm-up is requested for this config.
+    """True if persistent-daemon GEMM warm-up should run for this config.
+
+    Enabled by default whenever the GeminiFS offload spec is selected, because
+    the persistent daemon re-deadlocks on the first un-warmed chunked-prefill
+    GEMM without it; set ``geminifs_warmup_daemon`` to false in
+    kv_connector_extra_config to opt out.
 
     Warm-up only matters for the persistent daemon: the on-demand daemon
     (``geminifs_on_demand_daemon``) is deadlock-proof by construction and needs
@@ -113,7 +123,7 @@ def geminifs_daemon_warmup_enabled(vllm_config: Any) -> bool:
         return False
     if bool(extra_config.get("geminifs_on_demand_daemon", False)):
         return False
-    return bool(extra_config.get(_GEMINIFS_WARMUP_FLAG, False))
+    return bool(extra_config.get(_GEMINIFS_WARMUP_FLAG, _GEMINIFS_WARMUP_DEFAULT))
 
 
 def maybe_warmup_geminifs_daemon_gemms(vllm_config: Any, model_runner: Any) -> None:
