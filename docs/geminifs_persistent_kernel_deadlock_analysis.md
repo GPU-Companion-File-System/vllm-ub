@@ -274,3 +274,53 @@ makes `max_num_batched_tokens ≥ max_model_len` a patch (§4), now pushed out t
 full token range rather than eliminated by construction. The on-demand daemon
 remains deadlock-proof *independent* of shape; warm-up trades that guarantee for
 overlap.
+
+## 9. Green contexts (CUDA SM partitioning) evaluated and ruled out
+
+Hypothesis: would carving the daemon into its own **CUDA Green Context**
+(CUDA 12.4+ SM partitioning) let the daemon spin and the model GEMM coexist,
+while keeping the shared address space GeminiFS needs for KV pointers? Tested
+directly on this box (2× H100 PCIe, 114 SMs, CUDA 12.8); repro is
+`/tmp/gemini_sched/green_ctx.cu`: the SM resource is split via
+`cuDevSmResourceSplitByCount` into a small spinner partition + remainder, two
+green contexts are created (`cuGreenCtxCreate`) with streams
+(`cuGreenCtxStreamCreate`), the persistent 6×736 spinner is launched into the
+spinner green ctx, and a cold BF16 4096³ `cublasLtMatmul` is issued into the
+other green ctx. All cuBLAS state/buffers are built before the spinner, so only
+`cublasLtMatmul` runs under it (isolating lazy-load, per §8's caveat).
+
+| # | Setup | Result |
+|---|---|---|
+| 1 | green-ctx GEMM, **no** spinner (control) | **No hang** — 0.05 s; SM split = 16 + 98 = 114 |
+| 2 | 6×736 spinner in green-ctx A, **cold** GEMM in green-ctx B | **HANG** — completes 0.020 s after spinner release |
+| 3 | Warm the exact GEMM before spinner, same green-ctx setup | **No hang** — 0.05 s (warming still cures it) |
+| 4 | **1×1** spinner in an **8-SM** partition vs cold GEMM | **HANG** — completes 0.020 s after release |
+
+**Conclusion: green contexts do not solve this deadlock** — the cold GEMM hangs
+across *separate* green contexts with the identical signature as §3/§7 (hang →
+~20 ms completion on spinner release), and warming still cures it (row 3),
+confirming it is the same lazy-load mechanism, not a green-context artifact.
+
+- **Green contexts partition SMs spatially — the one axis already proven
+  irrelevant.** §3 row #6 showed a 1-thread / 1-SM spinner deadlocks a cold GEMM;
+  row 4 here reconfirms it inside green contexts (8-SM, 1×1 spinner still hangs).
+  Partitioning occupancy can't fix a deadlock that occupancy doesn't cause.
+- **Green contexts share one CUDA context / address space.** That is exactly why
+  they look attractive for GeminiFS (the daemon keeps direct KV pointers — the
+  thing MPS could not give, §7), but it is also why they fail: the lazy kernel
+  load needs a **device-wide quiescent point**, which SM partitioning does not
+  create, and there is no separate-context **time-slice preemption** — the *only*
+  mechanism §7 found that breaks this deadlock, and one that requires genuinely
+  separate contexts/processes (surrendering the shared address space).
+- **Green contexts are "MPS-within-a-process": concurrent spatial scheduling in
+  one context.** §7 row 3 already showed that configuration (same context,
+  concurrent spinner + GEMM) hangs; green contexts land in the same bucket.
+- **Not even an overlap lever.** Unlike the separate-process + MPS route (§7),
+  which could restore transfer/compute overlap *after* building cross-process KV
+  IPC, the daemon spin keeps the compute GPU non-idle regardless of which SM
+  partition it occupies — so a green-ctx daemon neither fixes the deadlock nor
+  buys overlap.
+
+Bottom line: green contexts change nothing about the single-context
+lazy-load-vs-spin deadlock. The on-demand daemon (`1c0e4fb`) and the
+persistent + warm-up path (§8) remain the two valid options.

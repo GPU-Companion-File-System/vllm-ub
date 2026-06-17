@@ -128,6 +128,9 @@ class EngineCoreEventType(enum.IntEnum):
     QUEUED = 1
     SCHEDULED = 2
     PREEMPTED = 3
+    # KVTransfer: async remote-KV load entered/left WAITING_FOR_REMOTE_KVS.
+    REMOTE_KV_LOAD_STARTED = 4
+    REMOTE_KV_LOAD_FINISHED = 5
 
 
 class EngineCoreEvent(msgspec.Struct):

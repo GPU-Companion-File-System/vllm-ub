@@ -212,6 +212,15 @@ class RequestStateStats:
     first_token_ts: float = 0.0
     last_token_ts: float = 0.0
 
+    # KVTransfer: monotonic engine-core timestamps bracketing the async remote-KV
+    # load (the WAITING_FOR_REMOTE_KVS dwell). For an async KV-connector cache hit
+    # the reload transfer happens in this window and is otherwise folded into
+    # queued_time (scheduled_ts is only stamped after the load completes). Both stay
+    # 0.0 for requests that never went through an async load. The transfer time is
+    # remote_kv_load_finish_ts - remote_kv_load_start_ts.
+    remote_kv_load_start_ts: float = 0.0
+    remote_kv_load_finish_ts: float = 0.0
+
     # first token latency
     first_token_latency: float = 0.0
 
@@ -406,6 +415,12 @@ class IterationStats:
             elif event.type == EngineCoreEventType.PREEMPTED:
                 self.num_preempted_reqs += 1
                 lora_states.request_waiting(req_id, lora_name)
+            elif event.type == EngineCoreEventType.REMOTE_KV_LOAD_STARTED:
+                if req_stats.remote_kv_load_start_ts == 0.0:  # first load only
+                    req_stats.remote_kv_load_start_ts = event.timestamp
+            elif event.type == EngineCoreEventType.REMOTE_KV_LOAD_FINISHED:
+                if req_stats.remote_kv_load_finish_ts == 0.0:  # first load only
+                    req_stats.remote_kv_load_finish_ts = event.timestamp
 
     def update_from_finished_request(
         self,

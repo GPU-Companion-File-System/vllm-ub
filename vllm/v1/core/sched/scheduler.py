@@ -549,6 +549,11 @@ class Scheduler(SchedulerInterface):
                 if request.status == RequestStatus.WAITING_FOR_REMOTE_KVS:
                     is_ready = self._update_waiting_for_remote_kv(request)
                     if is_ready:
+                        if self.log_stats:
+                            request.record_event(
+                                EngineCoreEventType.REMOTE_KV_LOAD_FINISHED,
+                                scheduled_timestamp,
+                            )
                         if request.num_preemptions:
                             # We must be loading for a resumed preemption
                             # rather than a new request.
@@ -771,6 +776,11 @@ class Scheduler(SchedulerInterface):
                     # into the WAITING_FOR_REMOTE_KV state.
                     skipped_waiting_requests.prepend_request(request)
                     request.status = RequestStatus.WAITING_FOR_REMOTE_KVS
+                    if self.log_stats:
+                        request.record_event(
+                            EngineCoreEventType.REMOTE_KV_LOAD_STARTED,
+                            scheduled_timestamp,
+                        )
                     continue
 
                 self.running.append(request)
