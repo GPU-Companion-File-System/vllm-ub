@@ -663,7 +663,7 @@ class OffloadingConnectorWorker:
             assert transfer_result.success
             req_id, store = self._jobs.pop(job_id)
             if (
-                transfer_result.transfer_time
+                transfer_result.transfer_time is not None
                 and transfer_result.transfer_size is not None
                 and transfer_result.transfer_type is not None
             ):
